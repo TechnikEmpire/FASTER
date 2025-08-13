@@ -90,11 +90,14 @@ class FileSystemFile {
 class ReleasableLockGuard
 {
 public:
-    ReleasableLockGuard(std::mutex* mutex)
+    ReleasableLockGuard(std::mutex* mutex, const bool defer = false)
     {
         m_mutex = mutex;
-        m_mutex->lock();
-        m_released = false;
+        if (!defer)
+        {
+            m_mutex->lock();
+            m_released = false;
+        }
     }
 
     ~ReleasableLockGuard()
@@ -103,6 +106,13 @@ public:
         {
             m_mutex->unlock();
         }
+    }
+
+    void Lock()
+    {
+        assert(!m_released);
+        m_mutex->unlock();
+        m_released = true;
     }
 
     void Unlock()
@@ -320,7 +330,7 @@ class FileSystemSegmentedFile {
   }
 
  private:
-  core::Status OpenSegment(uint64_t segment) {
+  core::Status OpenSegment(uint64_t segment, const bool lock_held = false) {
     class Context : public core::IAsyncContext {
      public:
       Context(void* files_)
@@ -344,7 +354,7 @@ class FileSystemSegmentedFile {
     };
 
     // Only one thread can modify the list of files at a given time.
-    ReleasableLockGuard lock{ &mutex_ };
+    ReleasableLockGuard lock{ &mutex_, lock_held };
     bundle_t* files = files_.load();
 
     if(segment < begin_segment_) {
@@ -357,13 +367,17 @@ class FileSystemSegmentedFile {
     }
 
     if(!files) {
-      // First segment opened.
+      // First segment opened.      
       void* buffer = std::malloc(bundle_t::size(1));
       bundle_t* new_files = new(buffer) bundle_t{ filename_, file_options_, handler_,
           segment, segment + 1 };
       files_.store(new_files);
       return core::Status::Ok;
     }
+
+    // The condition that invokes OpenSegment() with the lock already held should never
+    // reach here!
+    assert(lock_held == false);
 
     // Expand the list of files_.
     uint64_t new_begin_segment = std::min(files->begin_segment, segment);
@@ -425,16 +439,10 @@ class FileSystemSegmentedFile {
     // Only one thread can modify the list of files at a given time.
     ReleasableLockGuard lock{ &mutex_ };
     bundle_t* files = files_.load();
-    bool newFiles = false;
     if (!files) 
-    {
-        // First segment opened.
-        void* buffer = std::malloc(bundle_t::size(1));
-        bundle_t* new_files = new(buffer) bundle_t{ filename_, file_options_, handler_,
-            begin_segment_, begin_segment_ + 1 };
-        files_.store(new_files);
+    {   
+        assert(OpenSegment(begin_segment_, true) == core::Status::Ok);
         files = files_.load();
-        newFiles = true;
     }
 
     assert(files);
