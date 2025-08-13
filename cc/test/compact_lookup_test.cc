@@ -1355,7 +1355,7 @@ TEST_P(CompactLookupParameterizedOnDiskTestFixture, OnDiskRmw) {
   CreateNewLogDir(ROOT_PATH, log_fp);
 
   // NOTE: deliberately keeping the hash index small to test hash-chain chasing correctness.
-  //       This causes the test to be very slow, because the has index is constantly churning.
+  //       This causes the test to be very slow, because the hash index is constantly churning.
   //       One micro-optimization here would be to cache the hash on the Key.
   
   faster_t store{ 2048, (1 << 20) * 192, log_fp, 0.4 };
