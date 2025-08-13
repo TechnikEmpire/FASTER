@@ -1354,9 +1354,12 @@ TEST_P(CompactLookupParameterizedOnDiskTestFixture, OnDiskRmw) {
   std::string log_fp;
   CreateNewLogDir(ROOT_PATH, log_fp);
 
-  // NOTE: deliberately keeping the hash index small to test hash-chain chasing correctness
+  // NOTE: deliberately keeping the hash index small to test hash-chain chasing correctness.
+  //       This causes the test to be very slow, because the has index is constantly churning.
+  //       One micro-optimization here would be to cache the hash on the Key.
+  
   faster_t store{ 2048, (1 << 20) * 192, log_fp, 0.4 };
-  uint32_t num_records = 20000; // ~160 MB of data
+  uint32_t num_records = 10000;
 
   bool shift_begin_address = std::get<0>(GetParam());
   bool checkpoint = std::get<1>(GetParam());

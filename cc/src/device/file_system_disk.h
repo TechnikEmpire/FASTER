@@ -425,6 +425,18 @@ class FileSystemSegmentedFile {
     // Only one thread can modify the list of files at a given time.
     ReleasableLockGuard lock{ &mutex_ };
     bundle_t* files = files_.load();
+    bool newFiles = false;
+    if (!files) 
+    {
+        // First segment opened.
+        void* buffer = std::malloc(bundle_t::size(1));
+        bundle_t* new_files = new(buffer) bundle_t{ filename_, file_options_, handler_,
+            begin_segment_, begin_segment_ + 1 };
+        files_.store(new_files);
+        files = files_.load();
+        newFiles = true;
+    }
+
     assert(files);
     if(files->begin_segment >= new_begin_segment) {
       // Segments have already been truncated.

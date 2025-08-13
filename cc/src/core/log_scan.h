@@ -568,7 +568,7 @@ class ConcurrentLogPageIterator {
     Address head_address = head_address_.load();
 
     uint32_t next_page = old_page + 1;
-    pages_available = (old_page != head_address.page()) || (Address{ next_page, 0 } < until_);
+    pages_available = old_page != head_address.page() || Address{ next_page, 0 } < until_;
     if (!pages_available) {
       // No more pages..
       return nullptr;
@@ -649,7 +649,7 @@ class ConcurrentLogPageIterator {
     while (true) {
       Address tail_address = tail_address_.load();
       if (tail_address >= until_) {
-        break;
+          tail_address = until_;
       }
       // Has page been processed?
       auto& page = Page(tail_address.page());

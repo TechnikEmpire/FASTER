@@ -637,7 +637,9 @@ TEST_P(HotColdParameterizedTestParam, Rmw) {
               cold_index_config, 192_MiB, cold_fp,
               0.4, 0, rc_config, f2_compaction_config };
 
-  uint32_t num_records = 20000; // ~160 MB of data
+  
+  uint32_t num_records = 10000;
+
   store.StartSession();
 
   // Rmw initial (all records fit in-memory)
@@ -707,10 +709,13 @@ TEST_P(HotColdParameterizedTestParam, Rmw) {
   store.CompletePending(true);
 
   if (!auto_compaction) {
-    // perform hot-cold compaction
+    // perform hot-cold compaction Hot size is not guaranteed to be reduced if compaction
+    // was run before a page swap was necessary. Therefore, we do not assert that the hot
+    // store size (address range) has changed. BUDGET * MAX_COMPACTION_PERCENTAGE should
+    // have been copied to the cold store.
     uint64_t hot_size = store.hot_store.Size(), cold_size = store.cold_store.Size();
-    store.CompactHotLog(store.hot_store.hlog.safe_read_only_address.control(), true);
-    ASSERT_TRUE(store.hot_store.Size() < hot_size && store.cold_store.Size() > cold_size);
+    store.CompactHotLog(store.hot_store.hlog.safe_read_only_address.control(), true);        
+    ASSERT_TRUE(store.cold_store.Size() > cold_size);    
   }
 
   // Rmw, decrement by 1, 8 times -- random order
@@ -778,6 +783,193 @@ TEST_P(HotColdParameterizedTestParam, Rmw) {
   }
 
   store.StopSession();
+}
+
+TEST_P(HotColdParameterizedTestParam, RmwSpill) {
+    using Key = FixedSizeKey<uint64_t>;
+    using Value = LargeValue;
+
+    typedef FASTER::device::FileSystemDisk<handler_t, 1_GiB> disk_t; // 1GB file segments
+    typedef F2Kv<Key, Value, disk_t> f2_t;
+
+    std::string hot_fp, cold_fp;
+    CreateNewLogDir(root_path, hot_fp, cold_fp);
+
+    auto args = GetParam();
+    uint32_t table_size = std::get<0>(args);
+    bool auto_compaction = std::get<1>(args);
+    bool rc_enabled = std::get<2>(args);
+
+    log_info("\nTEST: Index size: %lu\tAuto compaction: %d\tUse Read Cache: %d",
+        table_size, auto_compaction, rc_enabled);
+
+    ReadCacheConfig rc_config{
+      .mem_size = 256_MiB,
+      .mutable_fraction = 0.5,
+      .pre_allocate = false,
+      .enabled = rc_enabled,
+    };
+
+    F2CompactionConfig f2_compaction_config;
+    f2_compaction_config.hot_store = HlogCompactionConfig{
+      250ms, 0.9, 0.1, 128_MiB, 256_MiB, 4, auto_compaction };
+    f2_compaction_config.cold_store = HlogCompactionConfig{
+      250ms, 0.9, 0.1, 128_MiB, 768_MiB, 4, auto_compaction };
+
+    f2_t::ColdIndexConfig cold_index_config{ table_size, 256_MiB, 0.6 };
+    f2_t store{ table_size, 192_MiB, hot_fp,
+                cold_index_config, 192_MiB, cold_fp,
+                0.4, 0, rc_config, f2_compaction_config };
+
+
+    uint32_t num_records = 20000; // ~160 MB of data
+
+    store.StartSession();
+
+    // Rmw initial. Will spill to disk.
+    for (size_t idx = 1; idx <= num_records; ++idx) {
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            CallbackContext<RmwContext<Key, Value>> context{ ctxt };
+            ASSERT_EQ(Status::Ok, result);
+            };
+        RmwContext<Key, Value> context{ Key(idx), Value(5) };
+        Status result = store.Rmw(context, callback, 1);
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending);
+    }
+    // Read. Will spill to disk.
+    for (size_t idx = 1; idx <= num_records; ++idx) {
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            ASSERT_EQ(result, Status::Ok);
+            CallbackContext<ReadContext<Key, Value>> context{ ctxt };
+            ASSERT_EQ(context->output.value, 5);
+            };
+        ReadContext<Key, Value> context{ idx };
+        Status result = store.Read(context, callback, 1);
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending);
+        if (result == Status::Ok) {
+            ASSERT_EQ(context.output.value, 5);
+        }
+    }
+
+    // Rmw, increment by 1, 4 times (in random order)
+    std::vector<uint64_t> keys;
+    for (size_t idx = 1; idx <= num_records; idx++) {
+        for (int t = 0; t < 4; ++t) {
+            keys.push_back(idx);
+        }
+    }
+    std::shuffle(keys.begin(), keys.end(), std::default_random_engine(42));
+
+    for (size_t idx = 0; idx < 4 * num_records; ++idx) {
+        uint64_t key = keys[idx];
+        assert(1 <= key && key <= num_records);
+
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            CallbackContext<RmwContext<Key, Value>> context{ ctxt };
+            ASSERT_EQ(Status::Ok, result);
+            };
+        RmwContext<Key, Value> context{ Key(key), Value(1) };
+        Status result = store.Rmw(context, callback, 1);
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending);
+
+        if (idx % kCompletePendingInterval == 0) {
+            store.CompletePending(false);
+        }
+    }
+    store.CompletePending(true);
+
+    // Read.
+    for (size_t idx = 1; idx <= num_records; ++idx) {
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            ASSERT_EQ(result, Status::Ok);
+            CallbackContext<ReadContext<Key, Value>> context{ ctxt };
+            ASSERT_EQ(context->output.value, 9);
+            };
+        ReadContext<Key, Value> context{ idx };
+        Status result = store.Read(context, callback, 1);
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending);
+        if (result == Status::Ok) {
+            ASSERT_EQ(context.output.value, 9);
+        }
+        if (idx % kCompletePendingInterval == 0) {
+            store.CompletePending(false);
+        }
+    }
+    store.CompletePending(true);
+
+    if (!auto_compaction) {
+        // perform hot-cold compaction
+        uint64_t hot_size = store.hot_store.Size(), cold_size = store.cold_store.Size();
+        store.CompactHotLog(store.hot_store.hlog.safe_read_only_address.control(), true);
+        ASSERT_TRUE(store.hot_store.Size() < hot_size && store.cold_store.Size() > cold_size);
+    }
+
+    // Rmw, decrement by 1, 8 times -- random order
+    keys.clear();
+    for (size_t idx = 1; idx <= num_records; idx++) {
+        for (int t = 0; t < 8; ++t) {
+            keys.push_back(idx);
+        }
+    }
+    std::shuffle(keys.begin(), keys.end(), std::default_random_engine(42));
+
+    for (size_t idx = 0; idx < 8 * num_records; ++idx) {
+        uint64_t key = keys[idx];
+        assert(1 <= key && key <= num_records);
+
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            CallbackContext<RmwContext<Key, Value>> context{ ctxt };
+            ASSERT_EQ(Status::Ok, result);
+            };
+        RmwContext<Key, Value> context{ Key(key), Value(-1) };
+        Status result = store.Rmw(context, callback, 1);
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending);
+
+        if (idx % kCompletePendingInterval == 0) {
+            store.CompletePending(false);
+        }
+    }
+    store.CompletePending(true);
+
+    // Append non-existent keys and reshuffle
+    for (size_t idx = 1; idx <= num_records; idx++) {
+        keys.push_back(num_records + idx);
+    }
+    std::shuffle(keys.begin(), keys.end(), std::default_random_engine(42));
+    // Read.
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
+        uint64_t key = keys[idx];
+        assert(1 <= key && key <= 2 * num_records);
+
+        auto callback = [](IAsyncContext* ctxt, Status result) {
+            CallbackContext<ReadContext<Key, Value>> context{ ctxt };
+            if (context->key().key > context->num_records) {
+                ASSERT_EQ(Status::NotFound, result);
+                return;
+            }
+            ASSERT_EQ(Status::Ok, result);
+            ASSERT_EQ(context->output.value, 1);
+            };
+        ReadContext<Key, Value> context{ Key(key), num_records };
+        Status result = store.Read(context, callback, 1);
+
+        ASSERT_TRUE(result == Status::Ok || result == Status::Pending ||
+            result == Status::NotFound);
+        if (result == Status::Ok) {
+            ASSERT_TRUE(1 <= key && key <= num_records);
+            ASSERT_EQ(context.output.value, 1);
+        }
+        else if (result != Status::Pending) {
+            ASSERT_EQ(Status::NotFound, result);
+            ASSERT_TRUE(key > num_records);
+        }
+
+        if (idx % kCompletePendingInterval == 0) {
+            store.CompletePending(false);
+        }
+    }
+
+    store.StopSession();
 }
 
 
